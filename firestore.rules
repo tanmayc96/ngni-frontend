@@ -1,0 +1,10 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Allow read access to the geojson and report collections
+    match /{collection}/{document} {
+      allow read: if collection == 'geojson' || collection == 'report';
+      allow write: if false; // Disallow write access by default
+    }
+  }
+}
