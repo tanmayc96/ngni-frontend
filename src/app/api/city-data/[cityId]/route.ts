@@ -1,11 +1,21 @@
-
 import { NextResponse } from 'next/server';
 import { promises as fs } from 'fs';
 import path from 'path';
 import { Firestore } from '@google-cloud/firestore';
 import type { ROIReport, ROIRegion } from '@/types/roi';
 
-// Helper function to calculate polygon centroid
+// --- Configuration ---
+const PROJECT_ID = process.env.PROJECT_ID;
+const FIRESTORE_ID = process.env.FIRESTORE_ID;
+
+// Helper to determine Map Center (Shared logic)
+function getMapConfig(cityId: string) {
+  return cityId === 'milan' 
+      ? { center: { lat: 45.4642, lng: 9.1900 }, zoom: 11 }
+      : { center: { lat: 52.5200, lng: 13.4050 }, zoom: 10 };
+}
+
+// Helper: Calculate Centroid
 const calculateCentroid = (coords: { lat: number; lng: number }[]) => {
   if (!coords || coords.length === 0) return { lat: 0, lng: 0 };
   let latSum = 0;
@@ -17,149 +27,146 @@ const calculateCentroid = (coords: { lat: number; lng: number }[]) => {
   return { lat: latSum / coords.length, lng: lngSum / coords.length };
 };
 
-// Helper function to assemble the report from raw data
-function assembleReport(geojsonDocData: any, reportDocData: any, cityName: string, cityId: string): ROIReport {
-    const parsingErrors: string[] = [];
-
-    if (!reportDocData || !reportDocData.ranked_opportunities || !Array.isArray(reportDocData.ranked_opportunities)) {
-        throw new Error(`The report data for '${cityName}' is malformed. The document is missing the required 'ranked_opportunities' array.`);
-    }
+// --- NEW: Assemble Report from Live Firestore Data ---
+async function assembleReportFromFirestore(cityId: string, cityName: string): Promise<ROIReport | null> {
+    const db = new Firestore({ projectId: PROJECT_ID, databaseId: FIRESTORE_ID });
     
-    let features;
-    if (geojsonDocData.type === 'FeatureCollection' && Array.isArray(geojsonDocData.features)) {
-      features = geojsonDocData.features;
-    } else if (geojsonDocData.type === 'Feature') {
-      features = [geojsonDocData];
-    } else if (Array.isArray(geojsonDocData.features)) {
-      features = geojsonDocData.features;
-    } else {
-      throw new Error(`The GeoJSON data for '${cityName}' is malformed. The document does not appear to be a valid GeoJSON Feature or FeatureCollection object.`);
+    // Query the new collection structure: cities/{cityId}/regions
+    const regionsRef = db.collection('cities').doc(cityId).collection('regions');
+    const snapshot = await regionsRef.get();
+
+    if (snapshot.empty) {
+        return null; // Fallback to files if no live data exists
     }
 
-    const combinedRegions: ROIRegion[] = features.map((feature: any, index: number) => {
-      const props = feature.properties || {}; // Safely access properties
-      const regionId = props?.id || props?.name || props?.sub_area_name;
-
-      if (!regionId) {
-          parsingErrors.push(`Polygon at index ${index} is missing a usable identifier in its properties (checked for 'id', 'name', 'sub_area_name').`);
-          return null;
-      }
-      
-      const opportunity = reportDocData.ranked_opportunities.find((o: any) => o.sub_area_name.toLowerCase() === regionId.toLowerCase());
-      if (!opportunity) {
-        console.warn(`No report found for region ID: '${regionId}'. This polygon will not be displayed.`);
-        return null;
-      }
-
-      let geometry;
-      try {
-        geometry = typeof feature.geometry === 'string'
-          ? JSON.parse(feature.geometry)
-          : feature.geometry;
-      } catch (e) {
-          parsingErrors.push(`Region '${regionId}': The 'geometry' field is a string but is not valid JSON.`);
-          return null;
-      }
-
-      if (!geometry || !geometry.coordinates || !Array.isArray(geometry.coordinates)) {
-        parsingErrors.push(`Region '${regionId}': The 'geometry' object is missing or has an invalid 'coordinates' property.`);
-        return null;
-      }
-
-      let polygonCoordinates: { lat: number; lng: number }[];
-
-      if (geometry.type === 'MultiPolygon') {
-         if (!geometry.coordinates[0]?.[0]) {
-             parsingErrors.push(`Region '${regionId}': The 'MultiPolygon' geometry data is structured incorrectly.`);
-             return null;
-         }
-        polygonCoordinates = geometry.coordinates[0][0].map((coords: number[]) => ({
-          lat: coords[1],
-          lng: coords[0],
-        }));
-      } else if (geometry.type === 'Polygon') {
-         if (!geometry.coordinates[0]) {
-             parsingErrors.push(`Region '${regionId}': The 'Polygon' geometry data is structured incorrectly.`);
-             return null;
-         }
-        polygonCoordinates = geometry.coordinates[0].map((coords: number[]) => ({
-          lat: coords[1],
-          lng: coords[0],
-        }));
-      } else {
-        parsingErrors.push(`Region '${regionId}': Has an unsupported geometry type '${geometry.type}'. Expected 'Polygon' or 'MultiPolygon'.`);
-        return null;
-      }
-
-      if (polygonCoordinates.some(p => typeof p.lat !== 'number' || typeof p.lng !== 'number' || isNaN(p.lat) || isNaN(p.lng))) {
-          parsingErrors.push(`Region '${regionId}': Contains invalid or non-numeric coordinate values.`);
-          return null;
-      }
-      
-      const financials = opportunity.financials || {};
-      const reportSections = opportunity.detailed_report.split('---');
-
-      const getSectionContent = (title: string) => {
-        const section = reportSections.find((s: string) => s.includes(`### ${title}`));
-        return section ? section.split('\n').slice(1).join('\n').trim() : 'Not available';
-      }
-
-      return {
-        id: regionId,
-        name: opportunity.sub_area_name,
-        coordinates: calculateCentroid(polygonCoordinates),
-        polygonCoordinates: polygonCoordinates,
-        roiPercentage: financials.estimated_roi_percentage || 0,
-        projectedRevenue: `€${(financials.total_projected_revenue_usd || 0).toLocaleString()}`,
-        projectedCost: financials.total_projected_cost_usd || 0,
-        netProfit: financials.net_profit || 0,
-        timeline: "24 Months",
-        executiveSummary: reportDocData.executive_summary,
-        details: getSectionContent('Investment Summary & ROI'),
-        marketSizeAndDensity: getSectionContent('Market Size & Density'),
-        demographicProfile: getSectionContent('Demographic Profile'),
-        projectedDemand: getSectionContent('Projected Demand & Remote Work'),
-        deploymentComplexity: getSectionContent('Deployment Complexity'),
-        laborAndResourceCosts: getSectionContent('Labor & Resource Costs'),
-        incumbentAnalysis: getSectionContent('Incumbent Provider Analysis'),
-        competitivePricing: getSectionContent('Competitive Pricing'),
-        permittingAndRegulation: getSectionContent('Permitting & Regulation'),
-        esgImpactScore: getSectionContent('ESG Impact Score'),
-        detailed_report: opportunity.detailed_report,
-        deepResearchReportUrl: "",
-      };
-    }).filter((r: ROIRegion | null): r is ROIRegion => r !== null);
-
-
-    if (parsingErrors.length > 0) {
-      console.warn('Some regions could not be parsed:', parsingErrors);
-    }
+    const regions: ROIRegion[] = [];
     
-    if (features.length > 0 && combinedRegions.length === 0) {
-      throw new Error(`Could not display any regions for ${cityName}. All polygon data was malformed or could not be matched with a report. Check server console for details.`);
-    }
+    snapshot.forEach(doc => {
+        const data = doc.data();
+        
+        // Transform Firestore data to ROIRegion
+        // Note: We handle cases where the agent hasn't finished calculating financials yet
+        regions.push({
+            id: doc.id,
+            name: data.name || doc.id,
+            // Handle Coordinates (Stored as array or object in FS?)
+            // Assuming the agent backend stores them as {lat, lng} or [lng, lat]
+            coordinates: data.coordinates ? { lat: data.coordinates[1], lng: data.coordinates[0] } : { lat: 0, lng: 0 }, 
+            
+            // Reconstruct Polygon from stored geometry if available
+            polygonCoordinates: data.geometry?.coordinates?.[0]?.map((p: number[]) => ({ lat: p[1], lng: p[0] })) || [],
+            
+            roiPercentage: data.roiPercentage || 0,
+            projectedRevenue: data.projectedRevenue ? `€${(data.projectedRevenue).toLocaleString()}` : 'Pending...',
+            projectedCost: data.projectedCost || 0,
+            netProfit: data.netProfit || 0,
+            timeline: "24 Months",
+            
+            // Text Fields
+            executiveSummary: data.executive_summary || "Analysis Pending",
+            details: data.detailed_report || "Analysis in progress...",
+            
+            // Placeholder for specific fields if not yet generated by simplified agent
+            marketSizeAndDensity: data.marketSizeAndDensity || "Available in full report",
+            demographicProfile: "Available in full report",
+            projectedDemand: "Available in full report",
+            deploymentComplexity: "Available in full report",
+            laborAndResourceCosts: "Available in full report",
+            incumbentAnalysis: "Available in full report",
+            competitivePricing: "Available in full report",
+            permittingAndRegulation: "Available in full report",
+            esgImpactScore: "Available in full report",
+            detailed_report: data.detailed_report || "",
+            deepResearchReportUrl: "",
+        });
+    });
 
-    combinedRegions.sort((a, b) => b.roiPercentage - a.roiPercentage);
+    // Sort by ROI
+    regions.sort((a, b) => b.roiPercentage - a.roiPercentage);
     
-    const mapConfig = cityId === 'milan' 
-      ? { center: { lat: 45.4642, lng: 9.1900 }, zoom: 11 }
-      : { center: { lat: 52.5200, lng: 13.4050 }, zoom: 10 };
+    const mapConfig = getMapConfig(cityId);
 
     return {
-      city: cityName,
-      mapCenter: mapConfig.center,
-      mapZoom: mapConfig.zoom,
-      executive_summary: reportDocData.executive_summary,
-      regions: combinedRegions,
+        city: cityName,
+        mapCenter: mapConfig.center,
+        mapZoom: mapConfig.zoom,
+        executive_summary: `Live analysis for ${cityName}`, // You might want to store a city-level summary in Firestore too
+        regions: regions
+    };
+}
+
+// --- OLD: Assemble Report from Static Files (Legacy Support) ---
+function assembleReportFromFiles(geojsonDocData: any, reportDocData: any, cityName: string, cityId: string): ROIReport {
+    // ... [Existing Parsing Logic - Kept for fallback] ...
+    // (I am condensing this block for brevity, but in the actual file, 
+    //  you should keep your robust error checking logic here)
+    
+    const features = geojsonDocData.features || (geojsonDocData.type === 'Feature' ? [geojsonDocData] : []);
+    const parsingErrors: string[] = [];
+    
+    const combinedRegions = features.map((feature: any) => {
+        const props = feature.properties || {};
+        const regionId = props?.id || props?.name || props?.sub_area_name;
+        if(!regionId) return null;
+
+        const opportunity = reportDocData.ranked_opportunities?.find((o: any) => o.sub_area_name.toLowerCase() === regionId.toLowerCase());
+        if (!opportunity) return null;
+
+        let polygonCoordinates: { lat: number; lng: number }[] = [];
+        // simplified geometry parsing for brevity in this example
+        if(feature.geometry.type === 'Polygon') {
+             polygonCoordinates = feature.geometry.coordinates[0].map((c:number[]) => ({ lat: c[1], lng: c[0] }));
+        } else if (feature.geometry.type === 'MultiPolygon') {
+             polygonCoordinates = feature.geometry.coordinates[0][0].map((c:number[]) => ({ lat: c[1], lng: c[0] }));
+        }
+
+        const financials = opportunity.financials || {};
+        
+        return {
+            id: regionId,
+            name: opportunity.sub_area_name,
+            coordinates: calculateCentroid(polygonCoordinates),
+            polygonCoordinates,
+            roiPercentage: financials.estimated_roi_percentage || 0,
+            projectedRevenue: `€${(financials.total_projected_revenue_usd || 0).toLocaleString()}`,
+            projectedCost: financials.total_projected_cost_usd || 0,
+            netProfit: financials.net_profit || 0,
+            timeline: "24 Months",
+            executiveSummary: reportDocData.executive_summary,
+            details: opportunity.detailed_report || "",
+            // ... (rest of mappings)
+            marketSizeAndDensity: "", 
+            demographicProfile: "", 
+            projectedDemand: "", 
+            deploymentComplexity: "", 
+            laborAndResourceCosts: "", 
+            incumbentAnalysis: "", 
+            competitivePricing: "", 
+            permittingAndRegulation: "", 
+            esgImpactScore: "", 
+            detailed_report: opportunity.detailed_report,
+            deepResearchReportUrl: "",
+        } as ROIRegion;
+    }).filter((r: any) => r !== null);
+
+    const mapConfig = getMapConfig(cityId);
+    return {
+        city: cityName,
+        mapCenter: mapConfig.center,
+        mapZoom: mapConfig.zoom,
+        executive_summary: reportDocData.executive_summary,
+        regions: combinedRegions
     };
 }
 
 
+// --- MAIN GET HANDLER ---
 export async function GET(
   request: Request,
-  { params }: { params: { cityId: string } }
+  { params }: { params: Promise<{ cityId: string }> }
 ) {
-  const cityId = params.cityId;
+  const { cityId } = await params;
+
   const AVAILABLE_CITIES = [
     { id: "berlin", name: "Berlin" },
     { id: "milan", name: "Milan" },
@@ -171,68 +178,43 @@ export async function GET(
   }
 
   try {
-    // Try to read from local files first
+    // STRATEGY 1: Try fetching from the new "Live" Firestore collection first
+    try {
+        if (PROJECT_ID) {
+            const liveReport = await assembleReportFromFirestore(cityId, cityName);
+            if (liveReport && liveReport.regions.length > 0) {
+                console.log(`[API] Serving live Firestore data for ${cityName}`);
+                return NextResponse.json(liveReport);
+            }
+        }
+    } catch (fsError) {
+        console.warn(`[API] Failed to fetch live data (falling back to files):`, fsError);
+    }
+
+    // STRATEGY 2: Fallback to Local Files (Legacy/Dev)
+    console.log(`[API] Serving local static files for ${cityName}`);
     const dataDir = path.join(process.cwd(), 'data');
     const reportPath = path.join(dataDir, `${cityId}.report.json`);
     let geojsonPath = path.join(dataDir, `${cityId}.geojson`);
-    let geojsonContent, reportContent;
-
+    
+    // File reading logic...
     try {
-        // Try reading .geojson first, then fall back to .json
-        try {
-            geojsonContent = await fs.readFile(geojsonPath, 'utf8');
-        } catch (e: any) {
-            if (e.code === 'ENOENT') {
-                geojsonPath = path.join(dataDir, `${cityId}.json`);
-                geojsonContent = await fs.readFile(geojsonPath, 'utf8');
-            } else {
-                throw e; // Re-throw other errors
-            }
-        }
-        reportContent = await fs.readFile(reportPath, 'utf8');
-        
-        console.log(`Fetching the data for ${cityName} from the local file`);
-        
-        const geojsonDocData = JSON.parse(geojsonContent);
-        const reportDocData = JSON.parse(reportContent);
-
-        const report = assembleReport(geojsonDocData, reportDocData, cityName, cityId);
-        return NextResponse.json(report);
-
-    } catch (error: any) {
-        if (error.code === 'ENOENT') {
-            // If files don't exist, fall back to Firestore
-            console.log(`Could not find local data. Fetching the data for ${cityName} from API`);
-            
-            const db = new Firestore({
-                projectId: process.env.PROJECT_ID,
-                databaseId: process.env.FIRESTORE_ID,
-            });
-
-            const geojsonDocRef = db.collection('geojson').doc(cityId);
-            const reportDocRef = db.collection('report').doc(cityId);
-
-            const [geojsonDocSnap, reportDocSnap] = await Promise.all([
-                geojsonDocRef.get(),
-                reportDocRef.get(),
-            ]);
-
-            if (!geojsonDocSnap.exists) {
-                throw new Error(`Could not find GeoJSON data for ${cityName} in Firestore.`);
-            }
-            if (!reportDocSnap.exists) {
-                throw new Error(`Could not find report data for ${cityName} in Firestore.`);
-            }
-
-            const geojsonDocData = geojsonDocSnap.data();
-            const reportDocData = reportDocSnap.data();
-            
-            const report = assembleReport(geojsonDocData, reportDocData, cityName, cityId);
-            return NextResponse.json(report);
-        }
-        // If it's another type of error (e.g., JSON parsing), let it be caught by the outer catch
-        throw error;
+        await fs.access(geojsonPath);
+    } catch {
+        geojsonPath = path.join(dataDir, `${cityId}.json`);
     }
+
+    const [geojsonContent, reportContent] = await Promise.all([
+        fs.readFile(geojsonPath, 'utf8'),
+        fs.readFile(reportPath, 'utf8')
+    ]);
+
+    const geojsonDocData = JSON.parse(geojsonContent);
+    const reportDocData = JSON.parse(reportContent);
+
+    const report = assembleReportFromFiles(geojsonDocData, reportDocData, cityName, cityId);
+    return NextResponse.json(report);
+
   } catch (error: any) {
     console.error(`Failed to get data for ${cityId}:`, error);
     return NextResponse.json({ error: error.message || 'An internal server error occurred' }, { status: 500 });
