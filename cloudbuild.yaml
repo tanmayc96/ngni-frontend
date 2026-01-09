@@ -1,0 +1,55 @@
+steps:
+  # ==============================================================================
+  # Step 1: OPTIMIZATION - Pull the previous 'latest' image to use as cache
+  # ==============================================================================
+  # The "|| true" ensures the build doesn't fail if this is the very first run
+  # and the image doesn't exist yet.
+  - name: 'gcr.io/cloud-builders/docker'
+    entrypoint: 'bash'
+    args:
+      - '-c'
+      - |
+        docker pull $_AR_HOSTNAME/$PROJECT_ID/$_AR_REPO/ngni-frontend:latest || true
+
+  # ==============================================================================
+  # Step 2: Build with Cache
+  # ==============================================================================
+  # We use '--cache-from' to tell Docker to use the layers we just pulled.
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '--cache-from'
+      - '$_AR_HOSTNAME/$PROJECT_ID/$_AR_REPO/ngni-frontend:latest'
+      - '-t'
+      - '$_AR_HOSTNAME/$PROJECT_ID/$_AR_REPO/ngni-frontend:$COMMIT_SHA'
+      - '-t'
+      - '$_AR_HOSTNAME/$PROJECT_ID/$_AR_REPO/ngni-frontend:latest'
+      - '.'
+
+  # ==============================================================================
+  # Step 3: Push to Artifact Registry
+  # ==============================================================================
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '$_AR_HOSTNAME/$PROJECT_ID/$_AR_REPO/ngni-frontend:$COMMIT_SHA'
+
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'push'
+      - '$_AR_HOSTNAME/$PROJECT_ID/$_AR_REPO/ngni-frontend:latest'
+
+# This section lists the images we pushed so they appear in the Cloud Build UI
+images:
+  - '$_AR_HOSTNAME/$PROJECT_ID/$_AR_REPO/ngni-frontend:$COMMIT_SHA'
+  - '$_AR_HOSTNAME/$PROJECT_ID/$_AR_REPO/ngni-frontend:latest'
+
+# ==============================================================================
+# CONFIGURATION VARIABLES (Substitutions)
+# ==============================================================================
+substitutions:
+  # 1. Your Artifact Registry location (e.g., us-central1-docker.pkg.dev)
+  _AR_HOSTNAME: 'europe-west1-docker.pkg.dev' 
+  
+  # 2. The name of the Repository you created inside Artifact Registry
+  _AR_REPO: 'sdp-docker'
